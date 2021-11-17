@@ -1,0 +1,172 @@
+---
+title: "01_downloading_OBIS_GBIF_occurrence_data"
+authors: "Mireia Valle"
+date: "15/11/2021"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warming = FALSE)
+```
+
+## OBIS/GBIF data download tutorial
+
+This is an short tutorial to show how to download OBIS/GBIF occurrence data for multiple species. The code has been written to be used in H2020 Mission Atlantic (No 862428) Project Task 3.4.
+
+The tutorial has been developed by Mireia Valle (github profile: MireiaValle, email: mvalle@azti.es) based on original code for sourcing OBIS and GBIF from Guillem Chust (email: gchust@azti.es) and some adaptations from Eduardo Ramirez. 
+
+Affiliation: AZTI, Marine Research, Basque Research and Technology Alliance (BRTA). Txatxarramendi ugartea z/g, 48395 Sukarrieta - Bizkaia, Spain
+
+### Loading libraries
+
+```{r}
+# Specific libraries to get the occurrence data
+#install.packages("robis") # https://cran.r-project.org/web/packages/robis/robis.pdf
+library(robis)
+library (rgbif)
+
+# Libraries for Spatial data 
+library(rgdal)
+
+# Library for plotting
+library(ggplot2)
+
+# Libraries for reading data
+library(data.table)
+library(dplyr)
+library(tidyr)
+
+# Library for reproducible workflow
+library(here)
+```
+
+### Reading species list
+```{r}
+species <- read.csv(here::here ("data", "raw_data", "species_list.csv"), header = TRUE, sep = ";")
+```
+
+### Loading study area
+```{r}
+# Load FAO (spatial multipolygon)
+FAO<- readOGR(here::here("data", "spatial", "FAO_Areas", "FAO_AREAS.shp"))
+
+#Selecting Atlantic FAO regions
+FAO_Atl <- FAO[FAO$OCEAN=="Atlantic",]
+
+#plot(FAO_Atl)
+```
+
+### Loop for getting the species occurrence data
+```{r}
+for (i in 1:nrow(species)) {
+  
+## DOWNLOAD DATA FROM BOTH DATASETS AND MERGE 
+  
+  ## Find data by scientific name in the datasets OBIS/GBIF
+  # Get data from OBIS
+  mydata.obis<-robis::occurrence(scientificname=species$SN[i])
+  # Get data from GBIF
+  mydata.gbif<-occ_data(scientificName=species$SN[i], hasCoordinate = TRUE, limit=100000)$data
+  
+  ## select columns of interest from downloaded data
+  #names(mydata.obis)
+  mydata.obis <-  mydata.obis %>%
+                  dplyr::select("scientificName",
+                   "decimalLongitude",
+                   "decimalLatitude",
+                   "date_year",
+                   "month",
+                   "day",
+                   "eventDate",
+                   "depth",
+                   "bathymetry",
+                   "occurrenceStatus",
+                   "sst")
+  #names(mydata.gbif)
+  mydata.gbif <- mydata.gbif %>%
+                  dplyr::select("acceptedScientificName",
+                   "decimalLongitude",
+                   "decimalLatitude",
+                   "year",
+                   "month",
+                   "day",
+                   "eventDate",
+                   "depth")
+  ## Add new fields and rename some columns from mydata.gbif dataframe in order to have the same columns and join both tables
+  mydata.gbif <- mydata.gbif %>% 
+    dplyr::rename(scientificName= "acceptedScientificName") %>% 
+    dplyr::rename(date_year = "year") %>% 
+    dplyr::mutate(bathymetry= NA) %>% 
+    dplyr::mutate(occurrenceStatus=1) %>% 
+    dplyr::mutate(sst= NA)
+
+  ## Join data from OBIS and GBIF 
+  mydata.fus<-rbind(mydata.obis,mydata.gbif)
+  
+  ## assign unique scientific name 
+  mydata.fus <- mydata.fus %>% 
+    dplyr::mutate(scientificName= paste(mydata.obis$scientificName[1]))
+  
+  #unique(mydata.fus$scientificName)
+
+## CLEAN RAW DATA 
+  
+  ## Mutate occurrenceStatus column giving value of 1 to all unique values of presences 
+  #unique(mydata.fus$occurrenceStatus)
+  
+  mydata.fus <-  mydata.fus %>% 
+    mutate(occurrenceStatus = ifelse(occurrenceStatus== "NA", NA, occurrenceStatus)) %>%
+    mutate(occurrenceStatus = ifelse(occurrenceStatus== "Present", 1, occurrenceStatus)) %>% 
+    mutate(occurrenceStatus = ifelse(occurrenceStatus== "present", 1, occurrenceStatus)) %>% 
+    mutate(occurrenceStatus = ifelse(occurrenceStatus== "Presente", 1, occurrenceStatus)) %>% 
+    mutate(occurrenceStatus = ifelse(occurrenceStatus== "Presence", 1, occurrenceStatus)) %>% 
+    mutate(occurrenceStatus = ifelse(occurrenceStatus== "P", 1, occurrenceStatus)) %>% 
+    mutate(occurrenceStatus = ifelse(occurrenceStatus== "Q", 1, occurrenceStatus)) %>% 
+    mutate(occurrenceStatus = replace_na(occurrenceStatus,1)) 
+    #unique(mydata.fus$occurrenceStatus)
+  
+## PREPARE DATA TO USE FAO ATLANTIC REGION MASK
+  
+  ## Prepare coordinate format and projection to be able to use FAO zone masks
+  dat <- data.frame(cbind(mydata.fus$decimalLongitude,mydata.fus$decimalLatitude))
+  ptos<-as.data.table(dat,keep.columnnames=TRUE)
+  
+  coordinates(ptos) <- ~ X1 + X2
+  
+  proj4string(ptos) <-proj4string(FAO)
+  
+  ## Select only occurrences from FAO Atlantic
+  match2<-data.frame(subset(mydata.fus,!is.na(over(ptos, FAO_Atl)[,1])))
+  
+  ## Extract the FAO area of each point
+  match3<-data.frame(subset(over(ptos, FAO_Atl), !is.na(over(ptos, FAO_Atl)[,1])))
+  data_fus<-cbind(F_AREA=match3$F_AREA,match2)
+
+## PREPARE DATA TO BE SAVED 
+  
+  nam<-paste0("SP",i,sep="")
+  assign(nam,data_fus)
+  
+  ## Save in "derived_data" folder as SP and a number relative to their position in the species list
+  #CHANGE THIS ACCORDING TO YOUR WORKING DIRECTORY! 
+  save(list=nam, file = paste0("~/PROJECTS/github/obis_gbif_tutorial/data/derived_data/",nam,".RData"))
+  
+}
+
+```
+
+### Mapping cleanned data 
+
+#SP1: Engraulis encrasicolus
+```{r}
+ggplot() +
+   geom_path(data = FAO_Atl, 
+             aes(x = long, y = lat, group = group),
+             color = 'gray', size = .2) +
+   geom_point(data=SP1, aes(x=decimalLongitude, y=decimalLatitude,colour= occurrenceStatus)) +
+   ggtitle("Engraulis encrasicolus distribution data")
+```
+
+
